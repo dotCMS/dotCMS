@@ -11,11 +11,11 @@ import com.dotmarketing.common.util.SQLUtil;
 import com.dotmarketing.db.DbConnectionFactory;
 import com.dotmarketing.db.HibernateUtil;
 import com.dotmarketing.exception.DotDataException;
-import com.dotmarketing.exception.DotHibernateException;
 import com.dotmarketing.factories.TreeFactory;
 import com.dotmarketing.portlets.categories.model.Category;
 import com.dotmarketing.util.InodeUtils;
 import com.dotmarketing.util.Logger;
+import com.dotmarketing.util.UUIDGenerator;
 import com.dotmarketing.util.UtilMethods;
 import com.dotmarketing.util.VelocityUtil;
 import java.sql.Connection;
@@ -27,8 +27,6 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
-import com.dotcms.repackage.net.sf.hibernate.ObjectNotFoundException;
-import org.apache.commons.beanutils.BeanUtils;
 
 /**
  *
@@ -58,12 +56,17 @@ public class CategoryFactoryImpl extends CategoryFactory {
 			HibernateUtil.delete(t);
 		}
 
-		object = (Category) HibernateUtil.load(Category.class, object.getInode());
+		object = find(object.getInode());
+        if(null == object) return;
 
 		PermissionAPI perAPI = APILocator.getPermissionAPI();
 		perAPI.removePermissions(object);
 
-		HibernateUtil.delete(object);
+		new DotConnect()
+				.setSQL(" DELETE FROM category WHERE inode = ? ")
+				.addParam(object.getInode())
+				.loadResults();
+
 		try {
 			cleanParentChildrenCaches(object);
 			catCache.remove(object);
@@ -76,14 +79,16 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	protected Category find(String id) throws DotDataException {
 	    if(!UtilMethods.isSet(id)) return null;
 	    
-		Category cat = catCache.get(id);
+	    Category cat = catCache.get(id);
 		if(cat == null) {
-			try {
-				cat = (Category) HibernateUtil.load(Category.class, id);
-			} catch (DotHibernateException e) {
-				if(!(e.getCause() instanceof ObjectNotFoundException))
-					throw e;
-			}
+
+				final List<Map<String, Object>> result = new DotConnect()
+						.setSQL(" SELECT * FROM category WHERE inode = ? ")
+						.addParam(id)
+						.loadObjectResults();
+
+				cat = result.isEmpty() ? null : convertForCategory(result.get(0));
+
 			if(cat != null)
 				try {
 					catCache.put(cat);
@@ -100,11 +105,15 @@ public class CategoryFactoryImpl extends CategoryFactory {
 			throw new DotDataException("null key passed in");
 		}
 		Category cat = catCache.getByKey(key);
-		if(cat ==null){
-			HibernateUtil hu = new HibernateUtil(Category.class);
-			hu.setQuery("from " + Category.class.getName() + " as cat where lower(cat.key) = ? and category0__1_.type='category'");
-			hu.setParam(key.toLowerCase());
-			cat = (Category) hu.load();
+		if(cat == null){
+
+			final List<Map<String, Object>> result = new DotConnect()
+					.setSQL(" SELECT * FROM category WHERE lower(category_key) = ?")
+					.addParam(key.toLowerCase())
+					.loadObjectResults();
+
+			cat = result.isEmpty() ? null : convertForCategory(result.get(0));
+
 			if(cat != null)
 				try {
 					catCache.put(cat);
@@ -118,27 +127,35 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	@Override
 	protected Category findByVar(final String variable) throws DotDataException {
 		DotPreconditions.checkArgument(UtilMethods.isSet(variable));
-		HibernateUtil hu = new HibernateUtil(Category.class);
-		hu.setQuery("from " + Category.class.getCanonicalName()
-				+ " WHERE category_velocity_var_name=?");
-		hu.setParam(variable);
-		return (Category) hu.load();
+
+		final List<Map<String, Object>> result = new DotConnect()
+				.setSQL(" SELECT * FROM category WHERE category_velocity_var_name = ?")
+				.addParam(variable)
+				.loadObjectResults();
+
+		return result.isEmpty() ? null : convertForCategory(result.get(0));
 	}
 
 	@Override
 	protected Category findByName(String name) throws DotDataException {
-		HibernateUtil hu = new HibernateUtil(Category.class);
-		hu.setQuery("from " + Category.class.getName() + " as cat where cat.categoryName = ? and category0__1_.type='category'");
-		hu.setParam(name);
-		return (Category) hu.load();
+
+		final List<Map<String, Object>> result = new DotConnect()
+				.setSQL(" SELECT * FROM category WHERE category_name = ?")
+				.addParam(name)
+				.loadObjectResults();
+
+		return result.isEmpty() ? null : convertForCategory(result.get(0));
+
 	}
 
 	@SuppressWarnings("unchecked")
 	@Override
 	protected List<Category> findAll() throws DotDataException {
-		HibernateUtil hu = new HibernateUtil(Category.class);
-		hu.setQuery("from " + Category.class.getCanonicalName());
-		List<Category> cats = hu.list();
+		final List<Map<String, Object>> result = new DotConnect()
+				.setSQL(" SELECT * FROM category ")
+				.loadObjectResults();
+
+		List<Category> cats = convertForCategories(result);
 		for(Category cat : cats) {
 			//Updating the cache since we are already loading all the categories
 			if(catCache.get(cat.getInode()) == null)
@@ -153,36 +170,86 @@ public class CategoryFactoryImpl extends CategoryFactory {
 
 	@Override
 	public void save(Category object) throws DotDataException {
-		String id = object.getInode();
-		if(InodeUtils.isSet(id)) {
-			try
-			{
-				Category cat = (Category) HibernateUtil.load(Category.class, id);
+		final String id = object.getInode();
+		try {
+			if (InodeUtils.isSet(id)) {
+				Category cat = find(id);
 				// WE NEED TO REMOVE ORIGINAL BEFORE SAVING BECAUSE THE KEY CACHE NEEDS TO BE CLEARED
 				// DOTCMS-5717
-				catCache.remove(cat);
-				BeanUtils.copyProperties(cat,object);
-				HibernateUtil.saveOrUpdate(cat);
-				cleanParentChildrenCaches(object);
-
-			}catch(Exception ex){
-				throw new DotDataException(ex.getMessage(),ex);
-			}
-		}else{
-			HibernateUtil.save(object);
-			try {
+				if (null != cat) {
+					catCache.remove(cat);
+					updateCategory(object);
+					cleanParentChildrenCaches(object);
+				} else {
+					insertCategory(object, id);
+					cleanParentChildrenCaches(object);
+					catCache.remove(object);
+				}
+			} else {
+				final String inode = UUIDGenerator.generateUuid();
+				insertCategory(object, inode);
 				cleanParentChildrenCaches(object);
 				catCache.remove(object);
-			} catch (DotCacheException e) {
-				throw new DotDataException(e.getMessage(), e);
 			}
+		} catch (DotCacheException ce){
+			throw new DotDataException(ce.getMessage(), ce);
 		}
 	}
 
+	/**
+	 *
+	 * @param object
+	 * @param inode
+	 * @throws DotDataException
+	 * @throws DotCacheException
+	 */
+	private void insertCategory(final Category object, final String inode)
+			throws DotDataException, DotCacheException {
+		final Date date = new Date();
+		new DotConnect()
+				.setSQL("INSERT INTO inode (inode, idate, type) VALUES (?,?,'category')")
+				.addParam(inode)
+				.addParam(date)
+				.loadResult();
+
+		new DotConnect()
+				.setSQL("INSERT INTO category(inode, category_name, category_key, sort_order, active, keywords, category_velocity_var_name, mod_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+				.addParam(inode)
+				.addParam(object.getCategoryName())
+				.addParam(object.getKey())
+				.addParam(object.getSortOrder())
+				.addParam(object.isActive())
+				.addParam(object.getKeywords())
+				.addParam(object.getCategoryVelocityVarName())
+				.addParam(date)
+				.loadResults();
+
+		//The returned object must have an id assigned back into the original object sent
+		object.setInode(inode);
+	}
+
+	/**
+	 *
+	 * @param object
+	 * @throws DotDataException
+	 */
+	private void updateCategory(final Category object) throws DotDataException {
+		new DotConnect()
+				.setSQL("UPDATE category SET category_name=?, category_key=?, sort_order=?, active=?, keywords=?, category_velocity_var_name=?, mod_date=? WHERE inode=?")
+				.addParam(object.getCategoryName())
+				.addParam(object.getKey())
+				.addParam(object.getSortOrder())
+				.addParam(object.isActive())
+				.addParam(object.getKeywords())
+				.addParam(object.getCategoryVelocityVarName())
+				.addParam(new Date())
+				.addParam(object.getInode())
+				.loadResults();
+	}
 
 	@Override
 	protected void saveRemote(Category object) throws DotDataException {
-		HibernateUtil.saveWithPrimaryKey(object, object.getInode());
+		save(object);
 		try {
 			cleanParentChildrenCaches(object);
 			catCache.remove(object);
@@ -228,26 +295,6 @@ public class CategoryFactoryImpl extends CategoryFactory {
 		}
 
 	}
-	
-	private List<Category> readCatFromDotConnect(List<Map<String,Object>> list) {
-	    List<Category> cats = new ArrayList<Category>();
-	    for(Map<String,Object> m : list) {
-            cats.add(readCatFromDotConnect(m));
-        }
-	    return cats;
-	}
-	
-	private Category readCatFromDotConnect(Map<String,Object> m) {
-	    Category cat = new Category();
-        cat.setActive(DbConnectionFactory.getDBTrue().equals(m.get("active")));
-        cat.setInode(m.get("inode").toString());
-        cat.setCategoryName(m.get("category_name")!=null ? m.get("category_name").toString() : null);
-        cat.setCategoryVelocityVarName(m.get("category_velocity_var_name")!=null?m.get("category_velocity_var_name").toString():null);
-        cat.setKey(m.get("category_key")!=null?m.get("category_key").toString():null);
-        cat.setKeywords(m.get("keywords")!=null?m.get("keywords").toString():null);
-        cat.setSortOrder(m.get("sort_order")!=null ? m.get("sort_order").toString() : "0");
-        return cat;
-	}
 
 	@SuppressWarnings("unchecked")
 	@Override
@@ -268,70 +315,78 @@ public class CategoryFactoryImpl extends CategoryFactory {
 
 	@SuppressWarnings("unchecked")
 	@Override
-	protected List<Category> getChildren(Categorizable parent, String orderBy)
+	protected List<Category> getChildren(final Categorizable parent, String orderBy)
 	throws DotDataException {
 		orderBy = SQLUtil.sanitizeSortBy(orderBy);
-		HibernateUtil hu = new HibernateUtil(Category.class);
-		hu.setSQLQuery("select {category.*} from inode category_1_, category, tree where " +
-				"category.inode = tree.child and tree.parent = ? and category_1_.inode = category.inode " +
-				"and category_1_.type = 'category' order by " + orderBy);
-		hu.setParam(parent.getCategoryId());
-		return (List<Category>) hu.list();
+
+		final List<Map<String, Object>> result = new DotConnect()
+				.setSQL("select category.* from inode category_1_, category, tree where " +
+						"category.inode = tree.child and tree.parent = ? and category_1_.inode = category.inode " +
+						"and category_1_.type = 'category' order by " + orderBy)
+				.addParam(parent.getCategoryId())
+				.loadObjectResults();
+
+		return convertForCategories(result);
 	}
 
 	@SuppressWarnings("unchecked")
 	@Override
-	protected List<Category> getChildren(Categorizable parent, String orderBy,
+	protected List<Category> getChildren(final Categorizable parent, String orderBy,
 			String relationType) throws DotDataException {
 		orderBy = SQLUtil.sanitizeSortBy(orderBy);
 
 		if(!UtilMethods.isSet(orderBy))
 			orderBy = "tree_order";
-		HibernateUtil hu = new HibernateUtil(Category.class);
-		hu.setSQLQuery("select {category.*} from inode category_1_, category, tree where " +
-				"tree.relation_type = ? and category.inode = tree.child and tree.parent = ? and category_1_.inode = category.inode " +
-				"and category_1_.type = 'category' order by " + orderBy);
-		hu.setParam(relationType);
-		hu.setParam(parent.getCategoryId());
-		return (List<Category>) hu.list();
+
+		final List<Map<String, Object>> result = new DotConnect()
+				.setSQL("select category.* from inode category_1_, category, tree where " +
+						"tree.relation_type = ? and category.inode = tree.child and tree.parent = ? and category_1_.inode = category.inode " +
+						"and category_1_.type = 'category' order by " + orderBy)
+				.addParam(relationType)
+				.addParam(parent.getCategoryId())
+				.loadObjectResults();
+
+		return convertForCategories(result);
+
 	}
 
 	@Override
-	protected List<Category> getParents(Categorizable child, String relationType) throws DotDataException {
-		HibernateUtil hu = new HibernateUtil(Category.class);
-		hu.setSQLQuery("select {category.*} from inode category_1_, category, tree " +
-				"where tree.relation_type = ? and tree.child = ? and tree.parent = category.inode and category_1_.inode = category.inode " +
-		"and category_1_.type = 'category' order by sort_order asc, category_name asc");
-		hu.setParam(relationType);
-		hu.setParam(child.getCategoryId());
-		@SuppressWarnings("unchecked")
-		List<Category> parents = (List<Category>) hu.list();
+	protected List<Category> getParents(final Categorizable child, final String relationType) throws DotDataException {
 
-		return parents;
+		final List<Map<String, Object>> result = new DotConnect()
+				.setSQL("select category.* from inode category_1_, category, tree " +
+						"where tree.relation_type = ? and tree.child = ? and tree.parent = category.inode and category_1_.inode = category.inode " +
+						"and category_1_.type = 'category' order by sort_order asc, category_name asc")
+				.addParam(relationType)
+				.addParam(child.getCategoryId())
+				.loadObjectResults();
+
+		return convertForCategories(result);
 	}
 
     @SuppressWarnings ("unchecked")
     @Override
-    protected List<Category> getParents ( Categorizable child ) throws DotDataException {
+    protected List<Category> getParents (final Categorizable child ) throws DotDataException {
 
         List<String> parentIds = catCache.getParents( child );
         List<Category> parents;
         if ( parentIds == null ) {
 
-            HibernateUtil hu = new HibernateUtil( Category.class );
-            hu.setSQLQuery( "select {category.*} from inode category_1_, category, tree " +
-                    "where tree.child = ? and tree.parent = category.inode and category_1_.inode = category.inode " +
-                    "and category_1_.type = 'category' order by sort_order asc, category_name asc" );
-            hu.setParam( child.getCategoryId() );
-            parents = (List<Category>) hu.list();
+			final List<Map<String, Object>> result = new DotConnect()
+					.setSQL("select category.* from inode category_1_, category, tree " +
+							"where tree.child = ? and tree.parent = category.inode and category_1_.inode = category.inode " +
+							"and category_1_.type = 'category' order by sort_order asc, category_name asc")
+					.addParam(child.getCategoryId())
+					.loadObjectResults();
 
+			parents = convertForCategories(result);
             try {
                 catCache.putParents( child, parents );
             } catch ( DotCacheException e ) {
                 throw new DotDataException( e.getMessage(), e );
             }
         } else {
-            parents = new ArrayList<Category>();
+            parents = new ArrayList<>();
             for ( String id : parentIds ) {
                 Category cat = find( id );
                 if ( cat != null ) {
@@ -344,7 +399,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
     }
 
 	@Override
-	protected void removeChild(Categorizable parent, Category child, String relationType) throws DotDataException {
+	protected void removeChild(final Categorizable parent, final Category child, String relationType) throws DotDataException {
 		if(!UtilMethods.isSet(relationType)){
 			relationType = "child";
 		}
@@ -361,7 +416,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	}
 
 	@Override
-	protected void removeChildren(Categorizable parent) throws DotDataException {
+	protected void removeChildren(final Categorizable parent) throws DotDataException {
 
 		List<Tree> trees = TreeFactory.getTreesByParent(parent.getCategoryId());
 		for(Tree tree : trees) {
@@ -376,7 +431,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	}
 
 	@Override
-	protected void removeParent(Categorizable child, Category parent)
+	protected void removeParent(final Categorizable child, final Category parent)
 	throws DotDataException {
 
 		Tree tree = TreeFactory.getTree(parent.getInode(), child.getCategoryId());
@@ -392,7 +447,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	}
 
 	@Override
-	protected void removeParents(Categorizable child) throws DotDataException {
+	protected void removeParents(final Categorizable child) throws DotDataException {
 		List<Tree> trees = TreeFactory.getTreesByChild(child.getCategoryId());
 		for(Tree tree : trees) {
 			TreeFactory.deleteTree(tree);
@@ -406,7 +461,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	}
 
 	@Override
-	protected void setChildren(Categorizable parent, List<Category> children)
+	protected void setChildren(final Categorizable parent, final List<Category> children)
 	throws DotDataException {
 
 		List<Tree> trees = TreeFactory.getTreesByParent(parent.getCategoryId());
@@ -425,7 +480,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	}
 
 	@Override
-	protected void setParents(Categorizable child, List<Category> parents)
+	protected void setParents(final Categorizable child, final List<Category> parents)
 	throws DotDataException {
 		List<Category> pars = getParents(child);
 		for (Category category : pars) {
@@ -444,34 +499,10 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	}
 
 	@Override
-	protected void deleteTopLevelCategories() {
-		Statement s = null;
-		Connection conn = null;
-		try {
-			conn = DbConnectionFactory.getDataSource().getConnection();
-			conn.setAutoCommit(false);
-			s = conn.createStatement();
-			StringBuilder sql = new StringBuilder();
-			sql.append("delete from category category left join tree tree on category.inode = tree.child, ");
-			sql.append("inode category_1_ where tree.child is null and category_1_.inode = category.inode and category_1_.type = 'category' ");
-			s.executeUpdate(sql.toString());
-			conn.commit();
-		} catch (SQLException e) {
-			try {
-				conn.rollback();
-			} catch (SQLException e1) {
-				Logger.error(this, e1.getMessage(), e1);
-			}
-
-			Logger.error(this, e.getMessage(), e);
-		} finally {
-			try {
-				s.close();
-				conn.close();
-			} catch (SQLException e) {
-
-				Logger.error(this, e.getMessage(), e);
-			}
+	protected void deleteTopLevelCategories() throws DotDataException {
+		final List<Category> topLevelCategories = findTopLevelCategories();
+        for (final Category category:topLevelCategories){
+        	delete(category);
 		}
 	}
 
@@ -532,7 +563,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	 * @param sqlResults sql query results
 	 * @return a list of categories objects
 	 */
-	private List<Category> convertForCategories(List<Map<String, Object>> sqlResults) {
+	 List<Category> convertForCategories(final List<Map<String, Object>> sqlResults) {
 
 		List<Category> categories = new ArrayList<>();
 
@@ -555,7 +586,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	 * @param sqlResult - The data of a specific category from the database.
 	 * @return The {@link Category} object.
 	 */
-	private Category convertForCategory(Map<String, Object> sqlResult) {
+	private Category convertForCategory(final Map<String, Object> sqlResult) {
 
 		Category category = null;
 		if ( sqlResult != null ) {
@@ -601,15 +632,15 @@ public class CategoryFactoryImpl extends CategoryFactory {
 			try {
 				conn.rollback();
 			} catch (SQLException e1) {
-				e1.printStackTrace();
+				Logger.error(CategoryFactoryImpl.class,e1);
 			}
-			e.printStackTrace();
+			Logger.error(CategoryFactoryImpl.class, e);
 		} finally {
 			try {
 				s.close();
 				conn.close();
 			} catch (SQLException e) {
-				e.printStackTrace();
+				Logger.error(CategoryFactoryImpl.class,e);
 			}
 		}
 	}
@@ -665,7 +696,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
 	protected void clearCache() {
 		catCache.clearCache();
 	}
-	public boolean  hasDependencies(Category cat) throws DotDataException {
+	public boolean  hasDependencies(final Category cat) throws DotDataException {
 
 		String query;
 		HibernateUtil dh = new HibernateUtil();
@@ -712,7 +743,7 @@ public class CategoryFactoryImpl extends CategoryFactory {
         }
 	}
 
-    public void sortChildren(String inode)  throws DotDataException {
+    public void sortChildren(final String inode)  throws DotDataException {
 
 		Statement statement = null;
 		Connection conn = null;
@@ -760,25 +791,14 @@ public class CategoryFactoryImpl extends CategoryFactory {
         }
 	}
 
-    private void putResultInCatCache( ResultSet rs ) throws SQLException, DotDataException {
+    private void putResultInCatCache( final ResultSet rs ) throws SQLException, DotDataException {
         while(rs.next()) {
-            Category cat = null;
-            try {
-                cat = (Category) HibernateUtil.load(Category.class, rs.getString("inode"));
-            } catch (DotHibernateException e) {
-                if(!(e.getCause() instanceof ObjectNotFoundException ))
-                    throw e;
-            }
-            if(cat != null)
-                try {
-                    catCache.put(cat);
-                } catch (DotCacheException e) {
-                    throw new DotDataException(e.getMessage(), e);
-                }
+			// calling find will put it into cache internally
+			find(rs.getString("inode"));
         }
     }
 
-    private void closeEverything( Statement s, Connection conn, ResultSet rs ) {
+    private void closeEverything( final Statement s, final Connection conn, final ResultSet rs ) {
         try {
             rs.close();
             s.close();
@@ -795,25 +815,25 @@ public class CategoryFactoryImpl extends CategoryFactory {
      * @throws DotDataException
      * @throws DotCacheException
      */
-    private void cleanParentChildrenCaches ( Category category ) throws DotDataException, DotCacheException {
+    private void cleanParentChildrenCaches ( final Category category ) throws DotDataException, DotCacheException {
 
-        List<String> parentIds = catCache.getParents( category );
+		final List<String> parentIds = catCache.getParents( category );
         if ( parentIds != null ) {
             for ( String parentId : parentIds ) {
                 catCache.removeChildren( parentId );
             }
         }
-		List<Category> children = catCache.getChildren( category );
+		final List<Category> children = catCache.getChildren( category );
 		if ( children != null ) {
-			for ( Category child : children ) {
+			for ( final Category child : children ) {
 				catCache.removeParents( child.getCategoryId() );
 			}
 		}
     }
 
-    protected String suggestVelocityVarName(String categoryVelVarName) throws DotDataException {
-        DotConnect dc = new DotConnect();
-        String var = VelocityUtil.convertToVelocityVariable(categoryVelVarName, false);
+    protected String suggestVelocityVarName(final String categoryVelVarName) throws DotDataException {
+        final DotConnect dc = new DotConnect();
+		String var = VelocityUtil.convertToVelocityVariable(categoryVelVarName, false);
         for (int i = 1; i < 100000; i++) {
           dc.setSQL(this.categorySQL.getVelocityVarNameCount());
           dc.addParam(var);
